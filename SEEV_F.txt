@@ -1,413 +1,145 @@
-//Nome ALUNO A- Rodrigo Lopes
-//Numero ALUNO A- 2171296
+// Nome ALUNO A- Rodrigo Lopes
+// Numero ALUNO A- 2171296
 
-//IPLEIRIA - Instituto Polit�cnico de Leiria
-//ESTG - Escola Superior de Tecnologia e Gest�o
-//LEAU- Licenciatura em Engenharia Autom�vel
-//SEEV - Sistemas El�tricos e Eletr�nicos de Ve�culos
+// IPLEIRIA - Instituto Politécnico de Leiria
+// ESTG - Escola Superior de Tecnologia e Gestão
+// LEAU- Licenciatura em Engenharia Automóvel
+// SEEV - Sistemas Elétricos e Eletrônicos de Veículos
 
-/*TP1: Pretende-se  neste  trabalho  pr�tico  a  implementa��o  de um  Sistema de Medi��o de Temperatura de um Motor de Combust�o
- * Interna, utilizando um sistema operativo de tempo real FreeRTOS.*/
-
-/*-LIBRARIES-----------------------------------------------------------------------------------------------------------------------*/
-#include "Arduino.h"
-//Sensor Temperatura e LCD
-#include <SPI.h>
-#include <WiFi.h>
-#include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
-#include <Adafruit_Sensor.h>
-#include <DHT.h>
-//SERVO
-#include <ESP32Servo.h>
-//INTERRUPT
-#include <stdio.h>
+/* TP1: Pretende-se neste trabalho prático a implementação de um Sistema de Medição de Temperatura de um Motor de Combustão interna, 
+utilizando um sistema operativo de tempo real FreeRTOS. */
+#include <Arduino.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "esp_system.h"
-#include "nvs_flash.h"
-#include "esp_task_wdt.h"
+#include "freertos/queue.h"
+#include <ESP32_Servo.h>
 
+// Pinos
+#define ONE_WIRE_BUS 2
+#define LED_PIN 4        // Pino do LED
+#define BUZZER_PIN 12    // Pino do Buzzer
+#define SERVO_PIN 13     // Pino do Servo
+#define RESET_BUTTON_PIN 14 // Pino do botão de reset
 
-/*-DEFINES------------------------------------------------------------------------------------------------------------------------*/
+// Inicializa a interface OneWire
+OneWire oneWire(ONE_WIRE_BUS);
 
-//LCD
-#define SCREEN_WIDTH 128 // OLED display width, in pixels
-#define SCREEN_HEIGHT 64 // OLED display height, in pixels
-//Sensor Temperatura - DHT11
-#define DHTPIN 14        // Digital pin connected to the DHT sensor
-#define DHTTYPE    DHT11 // Sensor DHT 11
-//LED
-#define LED_PIN_R 5	 //PIN 5 - Led VERMELHO
+// Inicializa o sensor DS18B20
+DallasTemperature sensors(&oneWire);
 
-//ADC
-#define THERMISOR_PIN 33 //PIN 33 - Sensor Anal�gico de Temperatura
+// Inicializa o motor servo
+Servo servo;
 
-//INTERRUPT PIN
-const uint8_t interruptPin = 32; //PIN 32 para but�o de interrup��o
+// Variável global para armazenar a temperatura simulada
+float simulatedTemperature = 0.0;
 
+// Variável para verificar o estado do botão de reset
+bool resetButtonState = false;
+bool lastResetButtonState = false;
 
-/*-FUNCTIONS---------------------------------------------------------------------------------------------------------------------*/
+// Filas para comunicação entre tarefas
+QueueHandle_t temperatureQueue;
+QueueHandle_t controlQueue;
 
-// Declaration for an SSD1306 display connected to I2C (SDA, SCL pins)
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+// Função da tarefa que lê a temperatura do sensor
+void readTemperatureTask(void *pvParameters) {
+  (void)pvParameters; // Apenas para evitar avisos de variável não utilizada
+  
+  for (;;) {
+    sensors.requestTemperatures(); // Solicita a leitura da temperatura
+    float realTemperature = sensors.getTempCByIndex(0); // Lê a temperatura em graus Celsius
+    
+    // Simula uma temperatura 20 graus Celsius acima da real
+    simulatedTemperature = realTemperature + 50.0;
 
-/*-TASK FUNCTIONS----------------------------------------------------------------------------------------------------------------*/
-
-void vTaskBrain(void*pvParameters);      //Fun��o Tarefa Brain
-void vTaskTEMPinLCD (void*pvParameters);  //Fun��o Tarefa que l� temperatura e mostra no LCD
-void vTaskBUZZER (void*pvParameters);	  //Fun��o Tarefa aciona o Buzzer
-void vTaskSERVO (void*pvParameters);	  //Fun��o Tarefa aciona o Servomotor
-void vTaskLEDS (void*pvParameters);	      //Fun��o Tarefa que controla os LED's
-void vTaskADC (void*pvParameters);	      //Fun��o Tarefa Sensor Temp. Anal�gico
-
-TaskHandle_t xHandleSERVO;
-TaskHandle_t xHandleLED;
-TaskHandle_t xHandleADC;
-
-static void vHandlerTask( void *pvParameters );
-
-/*-INTERRUPTS--------------------------------------------------------------------------------------------------------------------*/
-
-//static void vInterruptHandler( void );
-void IRAM_ATTR vInterruptHandler();
-
-/*-SEMAPHORES--------------------------------------------------------------------------------------------------------------------*/
-
-SemaphoreHandle_t xBinarySemaphore;
-
-/*-QUEUES------------------------------------------------------------------------------------------------------------------------*/
-
-QueueHandle_t xQueueTEMP, xQueueTempBRAIN, xQueueInterruptBRAIN;
-
-/*-MUTEX-------------------------------------------------------------------------------------------------------------------------*/
-portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
-
-SemaphoreHandle_t xMutex;
-
-
-/*-VOID SETUP--------------------------------------------------------------------------------------------------------------------*/
-void setup()
-{
-	Serial.begin(115200);
-
-	//Criar QUEUE's
-	xQueueTempBRAIN = xQueueCreate(1, sizeof(float));
-	xQueueTEMP = xQueueCreate(1, sizeof(float));
-	xQueueInterruptBRAIN = xQueueCreate(1, sizeof(float));
-
-	//Criar Sem�foro Bin�rio
-	vSemaphoreCreateBinary( xBinarySemaphore );
-	xMutex = xSemaphoreCreateMutex();
-
-	//Criar Tarefa Brain
-	xTaskCreatePinnedToCore( vTaskBRAIN, "Brain", 10000, NULL, 3, NULL, 1);
-
-	//Criar Tarefa p/ Mostrar Temperatura no LCD
-	xTaskCreatePinnedToCore( vTaskTEMPinLCD, "TempinLCD", 10000, NULL, 4, NULL, 0);
-
-	//Criar Tarefa p/ Servomotor
-	xTaskCreatePinnedToCore( vTaskSERVO, "Servomotor", 10000, NULL, 1, &xHandleSERVO, 1);
-
-	//Criar Tarefa p/ LED
-	xTaskCreatePinnedToCore( vTaskLEDS, "LED", 10000, NULL, 1, &xHandleLED, 1);
-
-	//Criar Tarefa p/ ADC
-	xTaskCreatePinnedToCore( vTaskADC, "ADC", 10000, NULL, 1, &xHandleADC, 1);
-
-
-
-	pinMode(interruptPin, INPUT_PULLUP); //Definir PIN da interrup��o com pullup interna
-	attachInterrupt(digitalPinToInterrupt(interruptPin), vInterruptHandler, FALLING);
-	interrupts();
-
-	/* Check the semaphore was created successfully. */
-	if( xBinarySemaphore != NULL ){
-
-		xTaskCreatePinnedToCore( vHandlerTask, "Handler", 1000, NULL, 3, NULL, 0); //Criar HandlerTask no Core
-	}
+    // Envia a temperatura lida para a fila
+    xQueueSend(temperatureQueue, &simulatedTemperature, portMAX_DELAY);
+    
+    vTaskDelay(pdMS_TO_TICKS(1000)); // Aguarda um segundo antes de ler novamente
+  }
 }
 
-/*-VOID vTASK------------------------------------------------------------------------------------------------------------------*/
+// Função da tarefa que verifica e ativa o LED, o buzzer e o servo quando a temperatura atinge 90 graus
+void controlTemperatureTask(void *pvParameters) {
+  (void)pvParameters; // Apenas para evitar avisos de variável não utilizada
 
-void vTaskBRAIN (void*pvParameters){ //Inicio da Tarefa Brain
-	TickType_t xLastWakeTime;               //Variavel para determinar n� de ticks
-	xLastWakeTime = xTaskGetTickCount();
-	float temperature, TempBrain;
-	int Emergency;
-
-	for(;;){
-		xQueueReceive(xQueueTEMP, &temperature, 0); //Receber Temperatura do DHT11
-		xQueueReceive(xQueueInterruptBRAIN, &Emergency, 0); //Receber estado do bot�o de emergencia
-		TempBrain = (temperature * 7.66666666)-100;  //Converter Temperatura Ambiente em Temp. aproximada do Motor
-
-		if(TempBrain>=100){
-			//Criar Tarefa p/ BUZZER
-			xTaskCreatePinnedToCore( vTaskBUZZER, "Buzzer", 10000, NULL, 1, NULL, 0);//Criar tarefa Buzzer no Core 0 apenas
-			//com temp>100
-		}
-
-		Serial.print("Emergency:"); //Verificar estado do bot�o em porta s�rie
-		Serial.println(Emergency);
-		if (Emergency == 1 && TempBrain > 115) { //Ativar Emerg�ncia apenas quando a TempBrain>115
-			int ledChannel_R = 5;
-			int resolution = 8;
-			int dutyCycle_R = 100;
-			//Led Red
-			ledcWrite(ledChannel_R, dutyCycle_R); //Acender Led Vermelho com dutycycle = 100
-
-		}
-
-
-
-		xQueueSendToBack(xQueueTempBRAIN, &TempBrain, 0); //Enviar Temp. aproximada do Motor
-
-		vTaskDelayUntil( &xLastWakeTime, ( 250 / portTICK_PERIOD_MS ) ); //Tarefa ocorre durante 250ms
-	}
-}                                           //Fim da Tarefa Brain
-
-static void vHandlerTask( void *pvParameters ){  //Inicio Handler Task
-	int Emergency = 0;
-	xSemaphoreTake( xBinarySemaphore, 0);        //Dar sinal verde � tarefa
-
-	for( ;; )
-	{
-		xSemaphoreTake( xBinarySemaphore, portMAX_DELAY ); //Dar sinal verde � tarefa
-		if(Emergency == 0){                       //Alterar estado do bot�o
-			Emergency = 1;
-		}
-		else
-			Emergency = 0;
-
-		vTaskDelay(200 / portTICK_PERIOD_MS);            //Tarefa ocorre durante 200ms
-		xSemaphoreTake( xBinarySemaphore, portMAX_DELAY );//Redundancia
-		xQueueSendToBack(xQueueInterruptBRAIN, &Emergency, 0);  //Enviar estado do bot�o para a brain
-	}
-}                                          //Fim da Handler Task
-
-void vInterruptHandler(){                                //Inicio Interrup��o
-	static signed portBASE_TYPE xHigherPriorityTaskWoken;
-
-	/* 'Give' o sem�foro para desbloquear a Task */
-	Serial.println("Interrupcao gerada");
-	xSemaphoreGiveFromISR( xBinarySemaphore, (signed portBASE_TYPE*)&xHigherPriorityTaskWoken );
-
-}                                         //Fim Interrup��o
-
-
-void vTaskTEMPinLCD (void*pvParameters){    //Inicio Tarefa TempInLCD
-	TickType_t xLastWakeTime;               //Variavel para determinar n� de ticks
-	xLastWakeTime = xTaskGetTickCount();
-	float oldtemp=0;
-
-	//Func��o Sensor Temperatura
-	DHT dht(DHTPIN, DHTTYPE);                //Definir Sensor de Temperatura
-
-	dht.begin();
-
-	xSemaphoreTake(xMutex, portMAX_DELAY);  //Mutex para proteger comunica��o I2C
-
-	if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {        //Detetar se est� a ocorrer comunica��o
-		Serial.println(F("SSD1306 allocation failed"));
-		for(;;);
-	}
-	vTaskDelay(1000 / portTICK_PERIOD_MS);       //Ocupar processador durante 1000ms
-	display.clearDisplay();                      //Limpar Display
-	display.setTextColor(WHITE);				//Selecionar cor do texto
-
-	for(;;){
-		vTaskDelay(2500 / portTICK_PERIOD_MS);  //Ocupar processador durante 2500ms
-
-		//Ler Temperatura
-		float temp = dht.readTemperature();     //Receber e ler temperatura do sensor DHT11
-
-
-		//Erro na leitura da temperatura
-		if (isnan(temp)) {
-			Serial.println("Failed to read from DHT sensor!");
-			temp=oldtemp;
-		}
-		else{
-			oldtemp = temp;
-		}
-
-		// clear display
-		display.clearDisplay();
-		//L� Temperatura corretamente
-		// display temperature
-		display.setTextSize(1);						//Selecionar tamanho do texto
-		display.setCursor(0,0);						//Selecionar onde imprime o texto no display
-		display.print("Temperature: ");
-		display.setTextSize(2.5);					//Selecionar tamanho do texto
-		display.setCursor(0,10);					//Selecionar onde imprime o texto no display
-		display.print((temp * 7.66666666)-100);		//Mostrar Temperatura no display
-		display.print(" ");
-		display.setTextSize(1);
-		display.cp437(true);                       //Desenhar "º" no display
-		display.write(167);
-		display.setTextSize(2);
-		display.print("C");
-
-		if( (temp * 7.66666666)-100 > 115){
-			display.setTextSize(3);                 //Selecionar tamanho do texto
-			display.setCursor(0,45);                //Selecionar onde imprime o texto no display
-			display.print("TOO HOT");
-		}
-		xSemaphoreGive(xMutex);                   //Mutex
-
-		xQueueSendToBack(xQueueTEMP, &temp, 0);   //Enviar valor temp para a Brain
-
-		//Testar Tarefa
-		Serial.print(F("Temperature: "));
-		Serial.println(temp);
-		Serial.println(F("Temperature: OK"));
-
-		display.display();
-		vTaskDelayUntil( &xLastWakeTime, ( 250 / portTICK_PERIOD_MS ) ); //Tarefa ocorre durante 250ms
-
-	}
-}                                              //Inicio Tarefa TempInLCD
-
-void vTaskBUZZER (void*pvParameters){       //Inicio Tarefa BUZER
-	//Porta Definida para o Buzzer c/ ESP32
-	int Buzzer = 15; //for ESP32
-
-	pinMode (Buzzer, OUTPUT);               //Definir pin do buzzer
-
-	for(;;){
-		digitalWrite (Buzzer, HIGH); //turn buzzer on
-		vTaskDelay(100 / portTICK_PERIOD_MS);
-		digitalWrite (Buzzer, LOW);  //turn buzzer off
-		vTaskDelay(1000 / portTICK_PERIOD_MS);
-
-		//Testar Tarefa
-		Serial.println(F("Buzzer: OK"));
-		vTaskDelete(NULL);                //Eliminar tarefa Buzzer
-	}
-}										//FIM Tarefa BUZZER
-
-void vTaskSERVO (void*pvParameters){ //Inicio Tarefa SERVO
-	TickType_t xLastWakeTime;
-	xLastWakeTime = xTaskGetTickCount();
-	float TempBrain;
-	//Servomotor
-	Servo myservo;  // create servo object to control a servo
-	int pos = 0;    // variable to store the servo position
-
-	myservo.attach(13);  // attaches the servo on pin 13 to the servo object
-
-
-
-	for(;;){
-
-		xQueueReceive(xQueueTempBRAIN, &TempBrain, 0);    //Receber valor de TempBRAIN
-
-		if(TempBrain>90){
-
-			for (pos = 0; pos <= 90; pos += 1) { // goes from 0 degrees to 90 degrees
-				// in steps of 1 degree
-				myservo.write(pos);              // tell servo to go to position in variable 'pos'
-				vTaskDelay(15 / portTICK_PERIOD_MS);                       // waits 15ms for the servo to reach
-			}              //the position
-			         
-		}
-
-		if(TempBrain<80){
-
-                   //the position
-      for (pos = 90; pos >= 0; pos -= 1) { // goes from 90 degrees to 0 degrees
-        myservo.write(pos);              // tell servo to go to position in variable 'pos'
-        vTaskDelay(15 / portTICK_PERIOD_MS);                       // waits 15ms for the servo to reach
-      }              //the position
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  servo.attach(SERVO_PIN); // Inicializa o servo
+  
+  for (;;) {
+    // Recebe a temperatura da fila com um curto tempo limite
+    float receivedTemperature;
+    if (xQueueReceive(temperatureQueue, &receivedTemperature, pdMS_TO_TICKS(100))) {
+      if (receivedTemperature >= 90.0) {
+        digitalWrite(LED_PIN, HIGH); // Liga o LED
+        digitalWrite(BUZZER_PIN, HIGH); // Liga o Buzzer
+        servo.write(180); // Move o servo para 180 graus
+      } else {
+        digitalWrite(LED_PIN, LOW); // Desliga o LED
+        digitalWrite(BUZZER_PIN, LOW); // Desliga o Buzzer
+        servo.write(0); // Move o servo de volta para 0 graus
+      }
     }
 
-		
+    vTaskDelay(pdMS_TO_TICKS(1000)); // Verifica a cada segundo
+  }
+}
 
+// Função da tarefa que exibe a temperatura no monitor serial
+void displayTemperatureTask(void *pvParameters) {
+  (void)pvParameters; // Apenas para evitar avisos de variável não utilizada
+  
+  for (;;) {
+    // Recebe a temperatura da fila com um curto tempo limite
+    float receivedTemperature;
+    if (xQueueReceive(temperatureQueue, &receivedTemperature, pdMS_TO_TICKS(100))) {
+      Serial.print("Temperatura Simulada: ");
+      Serial.print(receivedTemperature);
+      Serial.println(" °C");
+    }
 
-		//Testar Tarefa
-		Serial.println(F("SERVO: OK"));
-		vTaskDelayUntil( &xLastWakeTime, ( 150 / portTICK_PERIOD_MS ) ); //Tarefa ocorre durante 150ms
-	}
-}                                //Fim TAREFA SERVO
+    vTaskDelay(pdMS_TO_TICKS(50)); // Aguarda meio segundo antes de exibir novamente
+  }
+}
 
+// Função da tarefa que monitora o botão de reset
+void resetButtonTask(void *pvParameters) {
+  (void)pvParameters; // Apenas para evitar avisos de variável não utilizada
+  
+  for (;;) {
+    // Lê o estado do botão de reset
+    resetButtonState = digitalRead(RESET_BUTTON_PIN);
+    
+    // Verifica se o botão de reset foi pressionado
+    if (resetButtonState == LOW && lastResetButtonState == HIGH) {
+      esp_restart(); // Reinicia o ESP32
+    }
+    
+    lastResetButtonState = resetButtonState;
+    
+    vTaskDelay(pdMS_TO_TICKS(50)); // Verifica a cada 50 milissegundos
+  }
+}
 
-void vTaskLEDS (void*pvParameters){   //Inicio Tarefa LEDS
-	TickType_t xLastWakeTime;
-	xLastWakeTime = xTaskGetTickCount();
-	float TempBrain;
+void setup() {
+  Serial.begin(9600);
+  
+  sensors.begin(); // Inicializa o sensor DS18B20
 
-	int freq = 100000;               //Frequencia LEDS
-	int ledChannel_R = 5;            //PIN LED Vermelho
-	int resolution = 8;
+  // Inicializa as filas
+  temperatureQueue = xQueueCreate(1, sizeof(float));
+  controlQueue = xQueueCreate(1, sizeof(float));
+  
+  // Crie as tarefas do FreeRTOS
+  xTaskCreatePinnedToCore(readTemperatureTask, "ReadTempTask", 10000, NULL, 1, NULL, 0);
+  xTaskCreatePinnedToCore(controlTemperatureTask, "ControlTempTask", 10000, NULL, 2, NULL, 0); // Tarefa com prioridade 2
+  xTaskCreatePinnedToCore(displayTemperatureTask, "DisplayTempTask", 10000, NULL, 1, NULL, 0);
+  xTaskCreatePinnedToCore(resetButtonTask, "ResetButtonTask", 10000, NULL, 3, NULL, 1); // Tarefa do botão de reset com prioridade 3
+}
 
-
-	ledcSetup(ledChannel_R, freq, resolution);
-
-	ledcAttachPin(LED_PIN_R, ledChannel_R);
-
-
-	for(;;){
-
-		xQueueReceive(xQueueTempBRAIN, &TempBrain, 0);    //Receber valor de TempBRAIN
-
-		if( 100 <= TempBrain){
-		
-			//LED RED
-			for (int dutyCycle_R = 50; dutyCycle_R <= pow(2,resolution); dutyCycle_R++) {  //Piscar LED Vermelho
-				ledcWrite(ledChannel_R, dutyCycle_R);
-				vTaskDelay((1024/pow(2,resolution)) / portTICK_PERIOD_MS );
-			}
-
-			for (int dutyCycle_R = pow(2,resolution); dutyCycle_R >= 0; dutyCycle_R--) {
-				ledcWrite(ledChannel_R, dutyCycle_R);
-				vTaskDelay((1024/pow(2,resolution)) / portTICK_PERIOD_MS );
-			}
-		}
-
-
-
-
-
-		//Testar Tarefa
-		Serial.println(F("LED: OK"));
-		vTaskDelayUntil( &xLastWakeTime, ( 150 / portTICK_PERIOD_MS ) ); //Tarefa ocorre durante 150ms
-	}
-
-}                                //Fim Tarefa LEDS
-
-void vTaskADC (void*pvParameters){          //Inicio Tarefa Sensor Anal�gico
-	TickType_t xLastWakeTime;
-	xLastWakeTime = xTaskGetTickCount();
-	uint16_t Vo;
-	float R1 = 10000;
-	float logR2, R2, T, Tc, Tf;
-	float c1 = 1.009249522e-03, c2 = 2.378405444e-04, c3 = 2.019202697e-07;
-
-	for(;;){
-		Vo = analogRead(THERMISOR_PIN);                  //Equa��o de Convers�o Analog-Digital
-		R2 = R1 * (1023.0 / (float)Vo - 1.97640000032);
-		logR2 = log(R2);
-		T = (1.0 / (c1 + c2 * logR2 + c3 * logR2 * logR2 * logR2)); // temperature in Kelvin
-		Tc = T - 273.15; // Temperature in Celsius
-		Serial.print("Temperatura Ambiente: ");
-		Serial.print(Tc);
-		Serial.println("ºC");
-		vTaskDelay(1000 / portTICK_PERIOD_MS);
-
-		//Testar Tarefa
-		Serial.println(F("ADC: OK"));
-		vTaskDelayUntil( &xLastWakeTime, ( 150 / portTICK_PERIOD_MS ) ); //Tarefa ocorre durante 150ms
-	}
-}                                              //Fim da Tarefa ADC
-
-
-
-
-
-
-// The loop function is called in an endless loop
-void loop()
-{
-	vTaskDelete( NULL);
+void loop() {
+  // O loop não faz nada aqui, pois o trabalho é feito pelas tarefas do FreeRTOS.
 }
